@@ -17,6 +17,8 @@ const corsAllowedHeaders = process.env.NODE_ENV === 'production'
   ? ['Content-Type', 'Authorization']
   : ['Content-Type', 'Authorization', 'x-user-id', 'x-user-role', 'x-user-name'];
 
+const corsExposedHeaders = ['X-Total-Count', 'X-Page-Count', 'X-RateLimit-Remaining'];
+
 export const corsMiddleware = cors({
   origin: (origin, callback) => {
     if (!origin) return callback(null, true);
@@ -31,4 +33,7 @@ export const corsMiddleware = cors({
   },
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: corsAllowedHeaders,
+  exposedHeaders: corsExposedHeaders,
+  credentials: true,
+  maxAge: 86400,
 });
