@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events';
+import crypto from 'crypto';
 import logger from '../api/src/middleware/logger.js';
 
 class StoreTransaction {
@@ -10,7 +11,7 @@ class StoreTransaction {
         this.error = null;
         this.startTime = null;
         this.endTime = null;
-        this.id = `tx_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+        this.id = `tx_${crypto.randomBytes(16).toString('hex')}`;
     }
     
     begin() {
@@ -209,7 +210,9 @@ class GlobalStore extends EventEmitter {
                         return res;
                     })
                     .catch(async (error) => {
-                        await transaction.rollback();
+                        if (transaction.isActive) {
+                            await transaction.rollback();
+                        }
                         this.activeTransaction = null;
                         this.transactionHistory.push({
                             id: transaction.id,
@@ -233,7 +236,9 @@ class GlobalStore extends EventEmitter {
             return result;
             
         } catch (error) {
-            await transaction.rollback();
+            if (transaction.isActive) {
+                await transaction.rollback();
+            }
             this.activeTransaction = null;
             this.transactionHistory.push({
                 id: transaction.id,
