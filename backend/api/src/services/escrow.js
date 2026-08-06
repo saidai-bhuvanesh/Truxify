@@ -206,6 +206,36 @@ export function getEscrowBookingId (orderDisplayId) {
 }
 
 /**
+ * Read the on-chain booking struct for a booking id.
+ */
+export async function getEscrowBooking(escrowBookingId) {
+  if (!escrowContract) {
+    logger.warn('[escrow] Contract not initialised — cannot read booking.')
+    return null
+  }
+  if (!escrowBookingId) {
+    logger.warn('[escrow] Cannot read booking without a booking id.')
+    return null
+  }
+
+  try {
+    const booking = await escrowContract.bookings(escrowBookingId)
+    return {
+      customer: booking.customer,
+      driver: booking.driver,
+      amount: booking.amount,
+      status: Number(booking.status),
+      paid: booking.paid,
+      started: booking.started,
+      createdAt: booking.createdAt,
+    }
+  } catch (err) {
+    logger.error(`[escrow] getEscrowBooking failed: ${err.message}`)
+    return null
+  }
+}
+
+/**
  * Build an unsigned deposit transaction for the customer's wallet to sign.
  * Called when a bid is accepted and the order moves to in_progress.
  *

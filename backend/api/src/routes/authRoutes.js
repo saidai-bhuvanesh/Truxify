@@ -42,6 +42,8 @@
 
 import express from "express";
 import rateLimit from "express-rate-limit";
+import crypto from "crypto";
+import { z } from "zod";
 import { authenticate } from "../middleware/auth.js";
 import {
   userLimiter,
@@ -165,9 +167,7 @@ router.get("/session", authenticate, userLimiter, (req, res) => {
   });
 });
 
-import crypto from "crypto";
 import { otpSendSchema } from "../validation/requestSchemas.js";
-import { z } from "zod";
 import { verifyOtpHash } from "../lib/otpHashing.js";
 
 const verifyOtpSchema = z.object({
@@ -248,6 +248,16 @@ router.post("/verify-otp", otpVerificationLimiter, async (req, res) => {
     return res.status(500).json({ success: false, error: "Internal server error." });
   }
 });
+
+function generateVerificationToken(identifier) {
+  const payload = {
+    identifier,
+    type: "otp_verification",
+    iat: Math.floor(Date.now() / 1000),
+    exp: Math.floor(Date.now() / 1000) + 300,
+  };
+  return Buffer.from(JSON.stringify(payload)).toString("base64");
+}
 
 export default router;
 
