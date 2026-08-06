@@ -1,8 +1,22 @@
 import express from 'express';
+import rateLimit from 'express-rate-limit';
 import traceService from './trace.service.js';
 import logger from '../api/src/middleware/logger.js';
 
 const router = express.Router();
+
+// Rate limiter for shipment access - prevents brute force attacks
+const shipmentAccessLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // Limit each IP to 100 requests per window
+  message: {
+    success: false,
+    error: 'Too many requests',
+    message: 'Please try again later'
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
 // Create product
 router.post('/trace/product', async (req, res) => {
@@ -115,8 +129,48 @@ router.get('/trace/product/:productId', async (req, res) => {
     }
 });
 
-// Get shipment
-router.get('/trace/shipment/:shipmentId', async (req, res) => {
+/**
+ * Middleware to validate user access to shipment
+ * CWE-639: Insecure Direct Object Reference prevention
+ */
+async function validateShipmentAccess(req, res, next) {
+    const { shipmentId } = req.params;
+    const userId = req.user?.id;
+
+    if (!userId) {
+        logger.warn(`[SECURITY] Unauthorized shipment access attempt: ${shipmentId}`);
+        return res.status(401).json({
+            success: false,
+            error: 'Authentication required',
+            message: 'Please login to access shipment information'
+        });
+    }
+
+    try {
+        const hasAccess = await traceService.verifyShipmentOwnership(shipmentId, userId);
+
+        if (!hasAccess) {
+            logger.warn(`[SECURITY] IDOR attempt: User ${userId} tried to access shipment ${shipmentId}`);
+            return res.status(403).json({
+                success: false,
+                error: 'Access denied',
+                message: 'You do not have permission to view this shipment'
+            });
+        }
+
+        next();
+    } catch (error) {
+        logger.error('[SECURITY] Error validating shipment access:', error);
+        return res.status(500).json({
+            success: false,
+            error: 'Internal server error',
+            message: 'Unable to verify access permissions'
+        });
+    }
+}
+
+// Get shipment - PROTECTED with IDOR validation and rate limiting
+router.get('/trace/shipment/:shipmentId', shipmentAccessLimiter, validateShipmentAccess, async (req, res) => {
     try {
         const { shipmentId } = req.params;
         const shipment = await traceService.getShipment(shipmentId);
