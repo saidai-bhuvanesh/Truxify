@@ -5,7 +5,7 @@ import { acquireLock, releaseLock } from '../../lib/redisLock.js';
 import { measureExecution } from '../../core/performanceMetrics.js';
 import { supabaseAdmin } from '../../config/db.js';
 import {
-  escrowRefund,
+  submitEscrowRefund,
   recordDepositTx,
   submitEscrowRefund,
   submitEscrowCancelWithPenalty,
@@ -603,7 +603,7 @@ export class OrderLifecycleService {
           p_order_display_id: order.order_display_id,
           p_order_updates: updates,
           p_offer_updates: offerUpdates
-        }, userClient ?? supabaseAdmin);
+        }, supabaseAdmin);
 
         if (updateErr) {
           throw new DomainError(500, {
@@ -636,7 +636,7 @@ export class OrderLifecycleService {
     });
   }
 
-  async cancelOrder(orderId, customerId, reason) {
+  async cancelOrder(orderId, customerId, reason, userClient) {
     return measureExecution('OrderLifecycleService.cancelOrder', async () => {
       const { data: order, error: orderErr } = await this.orderRepository.findOrderByAnyId(orderId, '*');
       if (orderErr) throw new DomainError(500, { error: 'Failed to fetch order.', details: orderErr.message });
@@ -655,7 +655,11 @@ export class OrderLifecycleService {
         if (currentOrderErr) throw new DomainError(500, { error: 'Failed to fetch order.', details: currentOrderErr.message });
         if (!currentOrder) throw new DomainError(404, { error: 'Order not found.' });
 
-        const { data: otpCheck } = await this.orderRepository.findVerifiedDeliveryOtp(currentOrder.id);
+        // Runs under the caller's identity so RLS resolves get_profile_id() to
+        // the customer; the shared anon-key client always returns null here
+        // (drivers cannot read delivery_otps, and unauthenticated RLS yields
+        // no rows), which would silently disable the guard below.
+        const { data: otpCheck } = await this.orderRepository.findVerifiedDeliveryOtp(currentOrder.id, userClient);
         if (otpCheck) {
           throw new DomainError(409, { error: 'Cannot cancel: delivery OTP has already been verified.' });
         }
@@ -663,14 +667,14 @@ export class OrderLifecycleService {
         // The driver has already started the trip — a full-refund cancellation is
         // no longer possible. On-chain, cancelBooking / cancelWithPenalty revert
         // once the booking has been marked as started, so reject here first.
-        if (['picked_up', 'in_transit', 'arriving', 'arrived_dropoff'].includes(currentOrder.status)) {
+        if (['picked_up', 'in_transit', 'arriving', 'delivered'].includes(currentOrder.status)) {
           throw new DomainError(409, { error: 'Cannot cancel: the shipment has already been picked up and is in transit.' });
         }
 
         const requiresRefund = ['funded', 'refund_pending', 'refund_failed'].includes(currentOrder.escrow_status);
-        const penaltyBps = currentOrder.status === 'assigned'
+        const penaltyBps = currentOrder.status === 'truck_assigned'
           ? 1000
-          : ['arrived_pickup', 'picked_up', 'in_transit', 'arrived_dropoff'].includes(currentOrder.status)
+          : ['arrived_pickup', 'picked_up', 'in_transit', 'delivered'].includes(currentOrder.status)
             ? 5000
             : 0;
         const cancellationFee = currentOrder.total_amount && penaltyBps > 0
@@ -921,7 +925,7 @@ export class OrderLifecycleService {
           if (acceptErr) {
             logger.error('[confirm-deposit] accept_bid_tx failed:', acceptErr.message);
             try {
-              await escrowRefund(order.order_display_id);
+              await submitEscrowRefund(order.order_display_id);
             } catch (refundErr) {
               logger.error('[confirm-deposit] Escrow refund also failed:', refundErr.message);
             }
