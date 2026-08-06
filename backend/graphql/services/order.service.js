@@ -1,9 +1,11 @@
-import { ApolloServer } from '@apollo/server';
+﻿import { ApolloServer } from '@apollo/server';
 import { startStandaloneServer } from '@apollo/server/standalone';
 import { buildSubgraphSchema } from '@apollo/federation';
 import { gql } from 'graphql-tag';
-import { supabase } from '../api/src/config/db.js';
-import logger from '../api/src/middleware/logger.js';
+import DataLoader from 'dataloader';
+import { supabase } from '../../api/src/config/db.js';
+import logger from '../../api/src/middleware/logger.js';
+import { generateOrderDisplayId } from '../../api/src/lib/orderDisplayId.js';
 
 const ADMIN_ROLES = new Set(['ADMIN', 'admin']);
 
@@ -25,10 +27,74 @@ function mapOrder(row) {
         ...row,
         customerId: row.customerId ?? row.customer_id,
         driverId: row.driverId ?? row.driver_id,
-        cargoType: row.cargoType ?? row.cargo_type,
+        cargoType: row.cargoType ?? row.goods_type,
+        weight: row.weight ?? row.weight_tonnes,
+        amount: row.amount ?? row.total_amount,
+        pickup: {
+            lat: row.pickup_lat,
+            lng: row.pickup_lng,
+            address: row.pickup_address,
+        },
+        dropoff: {
+            lat: row.drop_lat,
+            lng: row.drop_lng,
+            address: row.drop_address,
+        },
         createdAt: row.createdAt ?? row.created_at,
         updatedAt: row.updatedAt ?? row.updated_at,
     };
+}
+
+// DataLoaders for N+1 query fix
+function createLoaders() {
+    const paymentLoader = new DataLoader(async (orderIds) => {
+        const { data: payments, error } = await supabase
+            .from('payments')
+            .select('*')
+            .in('order_id', orderIds);
+
+        if (error) {
+            logger.error('[N+1 FIX] Failed to batch fetch payments:', error);
+            return orderIds.map(() => null);
+        }
+
+        const paymentsByOrder = new Map();
+        payments?.forEach(payment => paymentsByOrder.set(payment.order_id, payment));
+        return orderIds.map(orderId => paymentsByOrder.get(orderId) || null);
+    });
+
+    const tripLoader = new DataLoader(async (orderIds) => {
+        const { data: trips, error } = await supabase
+            .from('trips')
+            .select('*')
+            .in('order_id', orderIds);
+
+        if (error) {
+            logger.error('[N+1 FIX] Failed to batch fetch trips:', error);
+            return orderIds.map(() => null);
+        }
+
+        const tripsByOrder = new Map();
+        trips?.forEach(trip => tripsByOrder.set(trip.order_id, trip));
+        return orderIds.map(orderId => tripsByOrder.get(orderId) || null);
+    });
+
+    return { paymentLoader, tripLoader };
+}
+
+const ORDER_STATUS_TO_DB = {
+    PENDING: 'pending',
+    CONFIRMED: 'truck_assigned',
+    ASSIGNED: 'truck_assigned',
+    IN_TRANSIT: 'in_transit',
+    COMPLETED: 'delivered',
+    CANCELLED: 'cancelled',
+    DISPUTED: 'cancelled',
+};
+
+function toDbStatus(status) {
+    if (!status) return status;
+    return ORDER_STATUS_TO_DB[status] || status.toLowerCase();
 }
 
 const typeDefs = gql`
@@ -151,7 +217,7 @@ const resolvers = {
             }
             
             if (status) {
-                query = query.eq('status', status);
+                query = query.eq('status', toDbStatus(status));
             }
             
             const { data, error } = await query;
@@ -181,13 +247,18 @@ const resolvers = {
                 .from('orders')
                 .insert([{
                     customer_id: customerId,
-                    pickup: input.pickup,
-                    dropoff: input.dropoff,
-                    weight: input.weight,
-                    distance: input.distance,
-                    cargo_type: input.cargoType,
-                    amount: input.amount,
-                    status: 'PENDING',
+                    order_display_id: generateOrderDisplayId(),
+                    pickup_address: input.pickup?.address,
+                    pickup_lat: input.pickup?.lat,
+                    pickup_lng: input.pickup?.lng,
+                    drop_address: input.dropoff?.address,
+                    drop_lat: input.dropoff?.lat,
+                    drop_lng: input.dropoff?.lng,
+                    goods_type: input.cargoType,
+                    weight_tonnes: input.weight,
+                    total_amount: input.amount,
+                    pickup_date: new Date().toISOString().slice(0, 10),
+                    status: toDbStatus(input.status) || 'pending',
                     created_at: new Date().toISOString()
                 }])
                 .select()
@@ -199,9 +270,13 @@ const resolvers = {
         updateOrder: async (_, { id, input }, { user }) => {
             const currentUser = requireUser(user);
             const updates = {
-                status: input.status,
-                pickup: input.pickup || undefined,
-                dropoff: input.dropoff || undefined,
+                status: toDbStatus(input.status),
+                pickup_address: input.pickup?.address ?? undefined,
+                pickup_lat: input.pickup?.lat ?? undefined,
+                pickup_lng: input.pickup?.lng ?? undefined,
+                drop_address: input.dropoff?.address ?? undefined,
+                drop_lat: input.dropoff?.lat ?? undefined,
+                drop_lng: input.dropoff?.lng ?? undefined,
                 updated_at: new Date().toISOString()
             };
 
@@ -228,7 +303,7 @@ const resolvers = {
             let query = supabase
                 .from('orders')
                 .update({
-                    status: 'CANCELLED',
+                    status: 'cancelled',
                     cancellation_reason: reason,
                     updated_at: new Date().toISOString()
                 })
@@ -247,30 +322,17 @@ const resolvers = {
     Order: {
         driver: async (order) => {
             if (!order.driverId) return null;
-            // Fetch driver from driver service
             return { id: order.driverId };
         },
-        payment: async (order) => {
-            // Fetch payment from payment service
-            const { data, error } = await supabase
-                .from('payments')
-                .select('*')
-                .eq('order_id', order.id)
-                .single();
-            
-            if (error) return null;
-            return data;
+        payment: async (order, _, { loaders }) => {
+            // Use DataLoader to batch fetch (N+1 fix)
+            if (!order.id) return null;
+            return loaders.paymentLoader.load(order.id);
         },
-        trip: async (order) => {
-            // Fetch trip from trip service
-            const { data, error } = await supabase
-                .from('trips')
-                .select('*')
-                .eq('order_id', order.id)
-                .single();
-            
-            if (error) return null;
-            return data;
+        trip: async (order, _, { loaders }) => {
+            // Use DataLoader to batch fetch (N+1 fix)
+            if (!order.id) return null;
+            return loaders.tripLoader.load(order.id);
         }
     }
 };
@@ -282,10 +344,15 @@ async function startOrderService() {
     });
 
     const { url } = await startStandaloneServer(server, {
-        listen: { port: 4001 }
+        listen: { port: 4001 },
+        context: async () => {
+            const loaders = createLoaders();
+            return { loaders };
+        }
     });
 
     logger.info(`✅ Order GraphQL service running at ${url}`);
+    logger.info('[N+1 FIX] DataLoader pattern implemented for payment and trip queries');
     return { url };
 }
 
