@@ -162,7 +162,8 @@ export function setupMessageHandler(cacheInvalidator) {
     const event = (() => {
       try {
         return JSON.parse(message);
-      } catch {
+      } catch (err) {
+        logger.warn({ err, channel, messagePreview: message.slice(0, 100) }, '[CachePublisher] Failed to parse event from Redis channel.');
         return null;
       }
     })();
@@ -240,7 +241,8 @@ export async function closeCachePublisher() {
   if (subscriber) {
     try {
       await subscriber.quit();
-    } catch {
+    } catch (err) {
+      logger.warn({ err }, '[CachePublisher] subscriber.quit failed, falling back to disconnect');
       subscriber.disconnect();
     }
     subscriber = null;
