@@ -21,7 +21,8 @@ class DIDService {
             'function verifyCredential(bytes32 credentialId) external view returns (bool)',
             'function getDID(string memory did) external view returns (address, string, bool, uint256, uint256)',
             'function getCredential(bytes32 credentialId) external view returns (tuple(bytes32, address, address, string, bytes32, uint256, uint256, bool, bytes32))',
-            'function isDIDActive(string memory did) external view returns (bool)'
+            'function isDIDActive(string memory did) external view returns (bool)',
+            'event CredentialIssued(bytes32 indexed credentialId, address issuer, address subject)'
         ];
 
         this.identityWalletABI = [
@@ -48,7 +49,7 @@ class DIDService {
         logger.info('✅ DID Service initialized');
     }
 
-    async createDID(userAddress) {
+    async createDID(userAddress, publicKey) {
         try {
             const did = `did:truxify:${uuidv4()}`;
 
@@ -58,12 +59,17 @@ class DIDService {
             await this.addServiceEndpoint(did, 'identity', 'IdentityService', `${process.env.API_URL}/api/did/identity`, 'Main identity service');
             await this.addServiceEndpoint(did, 'credentials', 'CredentialService', `${process.env.API_URL}/api/did/credentials`, 'Credential management service');
 
-            const keyPair = crypto.generateKeyPairSync('rsa', {
-                modulusLength: 2048,
-                publicKeyEncoding: { type: 'spki', format: 'pem' },
-                privateKeyEncoding: { type: 'pkcs8', format: 'pem' }
-            });
-            const publicKeyMultibase = Buffer.from(keyPair.publicKey).toString('base64');
+            let publicKeyMultibase = publicKey;
+            let privateKey = null;
+            if (!publicKeyMultibase) {
+                const keyPair = crypto.generateKeyPairSync('rsa', {
+                    modulusLength: 2048,
+                    publicKeyEncoding: { type: 'spki', format: 'pem' },
+                    privateKeyEncoding: { type: 'pkcs8', format: 'pem' }
+                });
+                publicKeyMultibase = Buffer.from(keyPair.publicKey).toString('base64');
+                privateKey = Buffer.from(keyPair.privateKey).toString('base64');
+            }
             await this.addVerificationMethod(did, 'key-1', 'RsaVerificationKey2018', did, publicKeyMultibase);
 
             await this.identityWallet.createWallet(did);
@@ -71,7 +77,7 @@ class DIDService {
             await this.storeDID({ did, owner: userAddress, publicKey: publicKeyMultibase });
 
             logger.info(`✅ DID created: ${did}`);
-            return { success: true, did, publicKey: publicKeyMultibase, txHash: receipt.hash };
+            return { success: true, did, publicKey: publicKeyMultibase, privateKey, txHash: receipt.hash };
         } catch (error) {
             logger.error('DID creation failed:', error);
             throw error;
@@ -117,9 +123,32 @@ class DIDService {
             );
             const receipt = await tx.wait();
 
-            const credentialId = ethers.keccak256(
-                ethers.toUtf8Bytes(`${Date.now()}:${this.wallet.address}:${subject}:${credentialType}`)
-            );
+            // Read the exact on-chain credentialId from the CredentialIssued
+            // event so it always matches the contract's own derivation.
+            let credentialId = null;
+            for (const log of receipt.logs) {
+                try {
+                    const parsed = this.didRegistry.interface.parseLog(log);
+                    if (parsed && parsed.name === 'CredentialIssued') {
+                        credentialId = parsed.args[0];
+                        break;
+                    }
+                } catch {
+                    // Not a DIDRegistry log; keep scanning.
+                }
+            }
+
+            if (!credentialId) {
+                // Fallback: reproduce abi.encodePacked(block.timestamp, msg.sender,
+                // subject, credentialType) using the actual block timestamp.
+                const block = await this.provider.getBlock(receipt.blockNumber);
+                credentialId = ethers.keccak256(
+                    ethers.solidityPacked(
+                        ["uint256", "address", "address", "string"],
+                        [block.timestamp, this.wallet.address, subject, credentialType]
+                    )
+                );
+            }
 
             await this.identityWallet.addCredential(credentialId);
 

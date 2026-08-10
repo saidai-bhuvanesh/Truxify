@@ -1,4 +1,5 @@
 import { ethers } from 'ethers';
+import crypto from 'crypto';
 import logger from '../../middleware/logger.js';
 import * as Sentry from '@sentry/node';
 import { supabase } from '../../config/db.js';
@@ -73,7 +74,7 @@ class KeyRotationService {
 
   async createRotationRecord(userId, walletAddress, reason) {
     try {
-      const rotationId = `rot_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      const rotationId = `rot_${crypto.randomUUID()}`;
 
       const { data, error } = await supabase
         .from('key_rotations')
@@ -170,23 +171,34 @@ class KeyRotationService {
         const tx = await signer.sendTransaction({
           to: this.escrowContract.target,
           data: this.escrowContract.interface.encodeFunctionData('transferKeyOwnership', [
-            newPrivateKey,
+            walletAddress,
             Date.now(),
           ]),
         });
 
         const receipt = await tx.wait();
 
-        await supabase
-          .from('key_ownership_transfers')
-          .insert([{
-            old_key: oldPrivateKey.slice(0, 10) + '...',
-            new_key: newPrivateKey.slice(0, 10) + '...',
-            wallet_address: walletAddress,
-            tx_hash: receipt.hash,
-            block_number: receipt.blockNumber,
-            completed_at: new Date().toISOString(),
-          }]);
+        // Receipt-row persistence is best-effort: the on-chain transfer has
+        // already committed, so a failed audit write must not surface as a
+        // transfer failure or trigger a duplicate re-transfer on retry.
+        try {
+          const { error: insertError } = await supabase
+            .from('key_ownership_transfers')
+            .insert([{
+              old_key: oldPrivateKey.slice(0, 10) + '...',
+              new_key: newPrivateKey.slice(0, 10) + '...',
+              wallet_address: walletAddress,
+              tx_hash: receipt.hash,
+              block_number: receipt.blockNumber,
+              completed_at: new Date().toISOString(),
+            }]);
+
+          if (insertError) {
+            logger.error('[KeyRotationService] Failed to record on-chain ownership transfer receipt:', insertError.message);
+          }
+        } catch (insertErr) {
+          logger.error('[KeyRotationService] Failed to record on-chain ownership transfer receipt:', insertErr.message);
+        }
 
         logger.info('[KeyRotationService] On-chain key ownership transfer completed:', receipt.hash);
 

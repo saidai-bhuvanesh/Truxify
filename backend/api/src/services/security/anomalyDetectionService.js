@@ -5,10 +5,19 @@ import { measureExecution } from '../../core/performanceMetrics.js';
 
 const ANOMALY_THRESHOLDS = {
   LARGE_WITHDRAWAL: 1000, // Threshold in MATIC
-  UNUSUAL_TIME: { startHour: 0, endHour: 6 }, // Unusual hours
+  UNUSUAL_TIME: { startHour: 0, endHour: 6 }, // Unusual hours (UTC)
   MULTIPLE_TRANSFERS: 5, // Number of transfers in 10 minutes
   UNUSUAL_DESTINATION: true, // New wallet destination
 };
+
+/**
+ * Defensive row cap on the 30-day withdrawal statistic pulls. PostgREST
+ * silently caps a single response at 1000 rows, so without an explicit
+ * bound the average/std-dev baseline would be computed from a truncated,
+ * non-deterministic sample for wallets with more than 1000 withdrawals in
+ * the window. Ordered by recency so the cap keeps the newest rows.
+ */
+const ANOMALY_STATS_MAX_ROWS = 1000;
 
 const ANOMALY_SEVERITY = {
   LOW: 'LOW',
@@ -23,11 +32,21 @@ class AnomalyDetectionService {
     this.keyRotationService = deps.keyRotationService;
   }
 
+  isWithdrawalDirection(transaction) {
+    return String(transaction?.type || '').toLowerCase() === 'withdrawal';
+  }
+
   async analyzeTransaction(userId, walletAddress, transaction) {
     return measureExecution('AnomalyDetectionService.analyzeTransaction', async () => {
       const anomalies = [];
 
-      const largeWithdrawal = await this.detectLargeWithdrawal(userId, walletAddress, transaction);
+      // Large-withdrawal scoring only applies to withdrawals. Deposits/credits
+      // must never be compared against the user's withdrawal statistics, and
+      // must never trigger an account lock.
+      let largeWithdrawal = null;
+      if (this.isWithdrawalDirection(transaction)) {
+        largeWithdrawal = await this.detectLargeWithdrawal(userId, walletAddress, transaction);
+      }
       if (largeWithdrawal) anomalies.push(largeWithdrawal);
 
       const unusualTime = this.detectUnusualTime(transaction);
@@ -53,6 +72,12 @@ class AnomalyDetectionService {
 
   async detectLargeWithdrawal(userId, walletAddress, transaction) {
     try {
+      // Defense-in-depth: even if a caller forgets to check the direction,
+      // never score a non-withdrawal transaction as a LARGE_WITHDRAWAL.
+      if (!this.isWithdrawalDirection(transaction)) {
+        return null;
+      }
+
       const amount = parseFloat(transaction.amount || 0);
 
       if (amount < ANOMALY_THRESHOLDS.LARGE_WITHDRAWAL) {
@@ -90,7 +115,9 @@ class AnomalyDetectionService {
         .eq('user_id', userId)
         .eq('wallet_address', walletAddress)
         .eq('type', 'withdrawal')
-        .gte('created_at', new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString());
+        .gte('created_at', new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString())
+        .order('created_at', { ascending: false })
+        .limit(ANOMALY_STATS_MAX_ROWS);
 
       if (error || !data || data.length === 0) {
         return ANOMALY_THRESHOLDS.LARGE_WITHDRAWAL / 2;
@@ -112,7 +139,9 @@ class AnomalyDetectionService {
         .eq('user_id', userId)
         .eq('wallet_address', walletAddress)
         .eq('type', 'withdrawal')
-        .gte('created_at', new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString());
+        .gte('created_at', new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString())
+        .order('created_at', { ascending: false })
+        .limit(ANOMALY_STATS_MAX_ROWS);
 
       if (error || !data || data.length < 2) {
         return ANOMALY_THRESHOLDS.LARGE_WITHDRAWAL / 4;
@@ -130,7 +159,11 @@ class AnomalyDetectionService {
 
   detectUnusualTime(transaction) {
     const txTime = new Date(transaction.timestamp);
-    const hour = txTime.getHours();
+    // Fix (#6127): use getUTCHours() so the window comparison is consistent
+    // with the UTC ISO timestamp stored in transaction.timestamp and reported
+    // in the message. getHours() returns server-local wall-clock time, which
+    // produces wrong results on any server not running at UTC offset 0.
+    const hour = txTime.getUTCHours();
 
     if (hour >= ANOMALY_THRESHOLDS.UNUSUAL_TIME.startHour &&
         hour < ANOMALY_THRESHOLDS.UNUSUAL_TIME.endHour) {
@@ -149,18 +182,18 @@ class AnomalyDetectionService {
     try {
       const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
 
-      const { data, error } = await supabase
+      const { count, error } = await supabase
         .from('transactions')
-        .select('id')
+        .select('id', { count: 'exact', head: true })
         .eq('user_id', userId)
         .eq('wallet_address', walletAddress)
         .gte('created_at', tenMinutesAgo);
 
-      if (error || !data) {
+      if (error) {
         return null;
       }
 
-      const transferCount = data.length;
+      const transferCount = count || 0;
 
       if (transferCount >= ANOMALY_THRESHOLDS.MULTIPLE_TRANSFERS) {
         return {

@@ -229,7 +229,8 @@ router.get('/faqs', async (req, res) => {
 
     res.json(faqs || []);
   } catch (err) {
-    res.status(500).json({ error: 'Internal Server Error' });
+    logger.error("[SupportRoutes] Error:", err?.message || err);
+    res.status(500).json({ error: err?.message || "Internal Server Error" });
   }
 });
 
@@ -325,6 +326,9 @@ router.get('/categories', (_req, res) => {
  */
 router.post('/tickets', authenticate, userLimiter, validateBody(createTicketSchema), async (req, res) => {
   const subject = normalizeRequiredText(req.body.subject);
+  if (!subject) {
+    return res.status(400).json({ error: 'subject is required and cannot be empty' });
+  }
   const category = normalizeRequiredText(req.body.category);
   const description = normalizeRequiredText(req.body.description) || subject;
 
@@ -362,7 +366,8 @@ router.post('/tickets', authenticate, userLimiter, validateBody(createTicketSche
       ticket,
     });
   } catch (err) {
-    res.status(500).json({ error: 'Internal Server Error' });
+    logger.error("[SupportRoutes] Error:", err?.message || err);
+    res.status(500).json({ error: err?.message || "Internal Server Error" });
   }
 });
 
@@ -466,7 +471,8 @@ router.get('/tickets', authenticate, userLimiter, async (req, res) => {
       },
     });
   } catch (err) {
-    res.status(500).json({ error: 'Internal Server Error' });
+    logger.error("[SupportRoutes] Error:", err?.message || err);
+    res.status(500).json({ error: err?.message || "Internal Server Error" });
   }
 });
 
@@ -501,7 +507,14 @@ router.get('/tickets', authenticate, userLimiter, async (req, res) => {
  *       404:
  *         description: Ticket not found
  */
-router.get('/tickets/:id', authenticate, userLimiter, validateParams(uuidParamSchema), async (req, res) => {
+router.get('/tickets/:id', authenticate, userLimiter, requirePolicy('ticket:view', async (req) => {
+  const { data: ticket } = await supabase
+    .from('support_tickets')
+    .select('id, user_id')
+    .eq('id', req.params.id)
+    .maybeSingle();
+  return { ticket };
+}), validateParams(uuidParamSchema), async (req, res) => {
   const ticketId = req.params.id;
 
   try {
@@ -522,13 +535,10 @@ router.get('/tickets/:id', authenticate, userLimiter, validateParams(uuidParamSc
       return res.status(404).json({ error: 'Support ticket not found.' });
     }
 
-    if (ticket.user_id !== req.user.id && req.user.role !== 'admin') {
-      return res.status(403).json({ error: 'Access Denied: You do not own this ticket.' });
-    }
-
     res.json(ticket);
   } catch (err) {
-    res.status(500).json({ error: 'Internal Server Error' });
+    logger.error("[SupportRoutes] Error:", err?.message || err);
+    res.status(500).json({ error: err?.message || "Internal Server Error" });
   }
 });
 
@@ -571,7 +581,14 @@ router.get('/tickets/:id', authenticate, userLimiter, validateParams(uuidParamSc
  *       404:
  *         description: Ticket not found
  */
-router.patch('/tickets/:id', authenticate, userLimiter, validateParams(uuidParamSchema), validateBody(updateTicketSchema), async (req, res) => {
+router.patch('/tickets/:id', authenticate, userLimiter, requirePolicy('ticket:update', async (req) => {
+  const { data: ticket } = await supabase
+    .from('support_tickets')
+    .select('id, user_id, status')
+    .eq('id', req.params.id)
+    .maybeSingle();
+  return { ticket };
+}), validateParams(uuidParamSchema), validateBody(updateTicketSchema), async (req, res) => {
   const ticketId = req.params.id;
   const { subject, description, category, status } = req.body;
 
@@ -593,12 +610,16 @@ router.patch('/tickets/:id', authenticate, userLimiter, validateParams(uuidParam
       return res.status(404).json({ error: 'Support ticket not found.' });
     }
 
-    if (ticket.user_id !== req.user.id && req.user.role !== 'admin') {
-      return res.status(403).json({ error: 'Access Denied: You do not own this ticket.' });
-    }
-
     if (ticket.status === 'closed') {
       return res.status(400).json({ error: 'Cannot update a closed ticket.' });
+    }
+
+    const isAdmin = req.user.role === 'admin';
+    const hasRestrictedOwnerUpdate = [subject, description, category].some((value) => value !== undefined);
+    if (!isAdmin && hasRestrictedOwnerUpdate) {
+      return res.status(403).json({
+        error: 'Access Denied: Only admins can update ticket content or category.',
+      });
     }
 
     const updates = { updated_at: new Date().toISOString() };
@@ -623,9 +644,14 @@ router.patch('/tickets/:id', authenticate, userLimiter, validateParams(uuidParam
     }
 
     if (status !== undefined) {
-      const normalizedStatus = status.toLowerCase().trim();
+      const statusResult = parseTicketStatus(status);
+      if (statusResult.error) {
+        return res.status(400).json({ error: statusResult.error });
+      }
+
+      const normalizedStatus = statusResult.value;
       const USER_ALLOWED_STATUSES = ['closed'];
-      if (req.user.role !== 'admin' && normalizedStatus !== ticket.status) {
+      if (!isAdmin && normalizedStatus !== ticket.status) {
         if (!USER_ALLOWED_STATUSES.includes(normalizedStatus)) {
           return res.status(403).json({
             error: 'Access Denied: Only admins can change ticket status.',
@@ -654,7 +680,8 @@ router.patch('/tickets/:id', authenticate, userLimiter, validateParams(uuidParam
       ticket: updatedTicket,
     });
   } catch (err) {
-    res.status(500).json({ error: 'Internal Server Error' });
+    logger.error("[SupportRoutes] Error:", err?.message || err);
+    res.status(500).json({ error: err?.message || "Internal Server Error" });
   }
 });
 
@@ -773,7 +800,8 @@ router.get('/admin/tickets', authenticate, userLimiter, requirePolicy('ticket:ad
       },
     });
   } catch (err) {
-    res.status(500).json({ error: 'Internal Server Error' });
+    logger.error("[SupportRoutes] Error:", err?.message || err);
+    res.status(500).json({ error: err?.message || "Internal Server Error" });
   }
 });
 
@@ -826,7 +854,14 @@ router.get('/admin/tickets', authenticate, userLimiter, requirePolicy('ticket:ad
  * @returns {object} 409 - Cannot comment on a closed ticket
  * @returns {object} 500 - Internal server error
  */
-router.post('/tickets/:id/comments', authenticate, userLimiter, validateParams(uuidParamSchema), validateBody(createTicketCommentSchema), async (req, res) => {
+router.post('/tickets/:id/comments', authenticate, userLimiter, requirePolicy('ticket:add-comment', async (req) => {
+  const { data: ticket } = await supabase
+    .from('support_tickets')
+    .select('id, user_id, status')
+    .eq('id', req.params.id)
+    .maybeSingle();
+  return { ticket };
+}), validateParams(uuidParamSchema), validateBody(createTicketCommentSchema), async (req, res) => {
   const ticketId = req.params.id;
   const { message } = req.body;
 
@@ -846,10 +881,6 @@ router.post('/tickets/:id/comments', authenticate, userLimiter, validateParams(u
 
     if (!ticket) {
       return res.status(404).json({ error: 'Support ticket not found.' });
-    }
-
-    if (ticket.user_id !== req.user.id && req.user.role !== 'admin') {
-      return res.status(403).json({ error: 'Access Denied: You do not own this ticket.' });
     }
 
     if (ticket.status === 'closed') {
@@ -880,7 +911,8 @@ router.post('/tickets/:id/comments', authenticate, userLimiter, validateParams(u
       comment,
     });
   } catch (err) {
-    res.status(500).json({ error: 'Internal Server Error' });
+    logger.error("[SupportRoutes] Error:", err?.message || err);
+    res.status(500).json({ error: err?.message || "Internal Server Error" });
   }
 });
 
@@ -927,7 +959,14 @@ router.post('/tickets/:id/comments', authenticate, userLimiter, validateParams(u
  *       404:
  *         description: Ticket not found
  */
-router.get('/tickets/:id/comments', authenticate, userLimiter, validateParams(paramIdSchema), async (req, res) => {
+router.get('/tickets/:id/comments', authenticate, userLimiter, requirePolicy('ticket:view-comments', async (req) => {
+  const { data: ticket } = await supabase
+    .from('support_tickets')
+    .select('id, user_id')
+    .eq('id', req.params.id)
+    .maybeSingle();
+  return { ticket };
+}), validateParams(paramIdSchema), async (req, res) => {
   const ticketId = req.params.id;
   const { sort } = req.query;
   if (sort !== undefined && sort !== 'asc' && sort !== 'desc') {
@@ -951,10 +990,6 @@ router.get('/tickets/:id/comments', authenticate, userLimiter, validateParams(pa
 
     if (!ticket) {
       return res.status(404).json({ error: 'Support ticket not found.' });
-    }
-
-    if (ticket.user_id !== req.user.id && req.user.role !== 'admin') {
-      return res.status(403).json({ error: 'Access Denied: You do not own this ticket.' });
     }
 
     const parsedLimit = parsePositiveInteger(req.query.limit, 100, 'limit');
@@ -985,7 +1020,8 @@ router.get('/tickets/:id/comments', authenticate, userLimiter, validateParams(pa
 
     res.json(comments || []);
   } catch (err) {
-    res.status(500).json({ error: 'Internal Server Error' });
+    logger.error("[SupportRoutes] Error:", err?.message || err);
+    res.status(500).json({ error: err?.message || "Internal Server Error" });
   }
 });
 

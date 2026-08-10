@@ -1,3 +1,20 @@
+
+/**
+ * @fileoverview userRoutes.js
+ *
+ * This module handles user-specific endpoints that do not fit other route modules.
+ *
+ * PRIMARY ENDPOINT: POST /api/users/fcm-token
+ *   Updates the Firebase Cloud Messaging (FCM) push token for the authenticated user.
+ *   This endpoint is kept separate from deviceRoutes.js to maintain clear authorization
+ *   scoping: the FCM token is a user-profile attribute (users own their notification
+ *   tokens), while deviceRoutes.js handles device-level registration (platform,
+ *   model, OS version). Splitting them prevents device operations from needing
+ *   user-level write access to profiles.
+ *
+ * @module routes/userRoutes
+ */
+
 /**
  * @openapi
  * components:
@@ -27,13 +44,29 @@ const fcmTokenSchema = z.object({
   fcmToken: z
     .string({ required_error: 'fcmToken is required' })
     .min(10, 'fcmToken must be at least 10 characters')
-    .max(4096, 'fcmToken must be at most 4096 characters')
-    .regex(/^[a-zA-Z0-9\-_:]+$/, 'fcmToken contains invalid characters'),
+    .max(4096, 'fcmToken must be at most 4096 characters'),
 });
 
 // ============================================================================
 // POST /api/users/fcm-token — update FCM token for the authenticated user
 // ============================================================================
+
+/**
+ * @fileoverview userRoutes.js
+ *
+ * This module handles user-specific endpoints that do not fit other route modules.
+ *
+ * PRIMARY ENDPOINT: POST /api/users/fcm-token
+ *   Updates the Firebase Cloud Messaging (FCM) push token for the authenticated user.
+ *   This endpoint is kept separate from deviceRoutes.js to maintain clear authorization
+ *   scoping: the FCM token is a user-profile attribute (users own their notification
+ *   tokens), while deviceRoutes.js handles device-level registration (platform,
+ *   model, OS version). Splitting them prevents device operations from needing
+ *   user-level write access to profiles.
+ *
+ * @module routes/userRoutes
+ */
+
 /**
  * @openapi
  * /api/users/fcm-token:
