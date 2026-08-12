@@ -21,7 +21,15 @@ const userClientRpc = vi.fn(async (fnName, args) => {
 
 vi.mock('../../src/config/db.js', () => ({
   supabase: m.supabase,
-  createUserClient: () => ({ rpc: userClientRpc }),
+  // The controller calls createUserClient(req.token).from(...),
+  // .storage.from(...) and .rpc(...), so the per-user client must expose the
+  // shared in-memory query builder + storage too, otherwise every happy-path
+  // upload 500s before the RPC.
+  createUserClient: () => ({
+    from: m.supabase.from.bind(m.supabase),
+    rpc: userClientRpc,
+    storage: m.supabase.storage,
+  }),
   firebaseAdmin: null,
   redisClient: null,
   mongoDb: null,
@@ -36,12 +44,14 @@ vi.mock('../../src/lib/malwareScanner.js', async (importOriginal) => {
 });
 
 const { default: maintenanceRouter } = await import('../../src/routes/maintenancePhotoRoutes.js');
+const { errorHandler } = await import('../../src/middleware/errorHandler.js');
 const { scanDocument } = await import('../../src/lib/malwareScanner.js');
 
 function buildApp() {
   const app = express();
   app.use(express.json());
   app.use('/api/maintenance', maintenanceRouter);
+  app.use(errorHandler);
   return app;
 }
 
@@ -73,6 +83,7 @@ describe('Maintenance Photo Routes Integration Tests', () => {
     ];
     m.store.__storageObjects = [];
     m.calls.length = 0;
+    scanDocument.mockClear();
     scanDocument.mockResolvedValue({ clean: true, engine: 'mock' });
   });
 
@@ -158,6 +169,37 @@ describe('Maintenance Photo Routes Integration Tests', () => {
       expect(res.status).toBe(422);
       expect(res.body.error).toMatch(/invalid|unsupported/i);
       expect(m.store.__storageObjects.length).toBe(0);
+    });
+
+    it('rejects a declared webp image at the route filter before buffering', async () => {
+      // Regression for #10961: a non-accepted image type must be rejected by
+      // the multer fileFilter (so the bytes are never buffered/processed),
+      // not buffered and then rejected by the controller. The previous
+      // implementation derived ALLOWED_PHOTO_MIME_TYPES from the shared
+      // document list, which would have silently allowed webp here.
+      const WEBP_BYTES = Buffer.from('RIFF....WEBP');
+      const res = await request(buildApp())
+        .post('/api/maintenance/ticket-uuid-001/photos')
+        .set(DRIVER_HEADERS)
+        .attach('photos', WEBP_BYTES, { filename: 'photo.webp', contentType: 'image/webp' });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/unsupported photo type/i);
+      expect(m.store.__storageObjects.length).toBe(0);
+      expect(scanDocument).not.toHaveBeenCalled();
+    });
+
+    it('rejects a declared PDF at the route filter before buffering', async () => {
+      const PDF_BYTES = Buffer.from('%PDF-1.4\n%âãÏÓ\n');
+      const res = await request(buildApp())
+        .post('/api/maintenance/ticket-uuid-001/photos')
+        .set(DRIVER_HEADERS)
+        .attach('photos', PDF_BYTES, { filename: 'doc.pdf', contentType: 'application/pdf' });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/unsupported photo type/i);
+      expect(m.store.__storageObjects.length).toBe(0);
+      expect(scanDocument).not.toHaveBeenCalled();
     });
 
     it('returns 500 if storage upload fails', async () => {
